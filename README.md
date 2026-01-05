@@ -1,0 +1,2 @@
+# podump
+kubectl pod dump
