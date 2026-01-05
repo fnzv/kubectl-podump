@@ -144,7 +144,7 @@ func main() {
 		ephemeral := corev1.EphemeralContainer{
 			EphemeralContainerCommon: corev1.EphemeralContainerCommon{
 				Name:    containerName,
-				Image:   "nicolaka/netshoot",
+				Image:   "ghcr.io/fnzv/podump",
 				Command: tcpdumpCmd,
 				SecurityContext: &corev1.SecurityContext{
 					Privileged: boolPtr(true),
