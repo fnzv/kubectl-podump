@@ -1,4 +1,4 @@
-module github.com/youruser/kubectl-tap-next
+module github.com/fnzv/podump
 
 go 1.25.0
 
