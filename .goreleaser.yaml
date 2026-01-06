@@ -38,3 +38,45 @@ release:
   github:
     owner: fnzv
     name: podump
+
+krews:
+  - name: podump
+    repository:
+      owner: fnzv
+      name: krew-index
+    directory: plugins
+    homepage: https://github.com/fnzv/podump
+    short_description: Dump pod logs and specs
+    description: |
+      A command-line tool to quickly export Kubernetes pod 
+      specifications and logs to local files for debugging.
+    caveats: |
+      Usage:
+        kubectl podump [pod-name]
+    
+    platforms:
+      - selector:
+          matchLabels:
+            os: darwin
+            arch: amd64
+        bin: kubectl-podump
+      - selector:
+          matchLabels:
+            os: darwin
+            arch: arm64
+        bin: kubectl-podump
+      - selector:
+          matchLabels:
+            os: linux
+            arch: amd64
+        bin: kubectl-podump
+      - selector:
+          matchLabels:
+            os: linux
+            arch: arm64
+        bin: kubectl-podump
+      - selector:
+          matchLabels:
+            os: windows
+            arch: amd64
+        bin: kubectl-podump.exe
