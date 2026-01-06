@@ -54,4 +54,4 @@ snapshot:
 release:
   github:
     owner: fnzv
-    name: podump
+    name: kubectl-podump
