@@ -21,7 +21,7 @@ builds:
       - -s -w -X main.version={{.Version}}
 
 archives:
-  - formats: ["tar.gz"] # v2 uses plural 'formats'
+  - formats: ["tar.gz"]
     name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
     format_overrides:
       - goos: windows
@@ -33,13 +33,11 @@ archives:
 checksum:
   name_template: 'checksums.txt'
 
-# Krew configuration for GoReleaser v2
 krews:
   - name: podump
-    repository: # v1 used 'index', v2 uses 'repository'
+    repository:
       owner: fnzv
       name: krew-index
-    directory: plugins
     homepage: https://github.com/fnzv/podump
     short_description: Dump pod logs and specs
     description: |
@@ -48,32 +46,6 @@ krews:
     caveats: |
       Usage:
         kubectl podump [pod-name]
-    platforms:
-      - selector:
-          matchLabels:
-            os: darwin
-            arch: amd64
-        bin: kubectl-podump
-      - selector:
-          matchLabels:
-            os: darwin
-            arch: arm64
-        bin: kubectl-podump
-      - selector:
-          matchLabels:
-            os: linux
-            arch: amd64
-        bin: kubectl-podump
-      - selector:
-          matchLabels:
-            os: linux
-            arch: arm64
-        bin: kubectl-podump
-      - selector:
-          matchLabels:
-            os: windows
-            arch: amd64
-        bin: kubectl-podump.exe
 
 snapshot:
   version_template: "{{ incpatch .Version }}-next"
