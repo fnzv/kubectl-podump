@@ -51,4 +51,7 @@ jobs:
           version: "~> v2"
           args: release --clean
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # This token must have write access to BOTH podump (for releases) 
+          # AND krew-index (for the manifest push). 
+          # A single PAT with access to both is the cleanest way.
+          GITHUB_TOKEN: ${{ secrets.KREW_TOKEN }}
