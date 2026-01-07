@@ -8,7 +8,8 @@ import (
 	"io"
 	"os"
 	"os/signal"
-	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,26 +25,34 @@ import (
 	"k8s.io/client-go/tools/remotecommand"
 )
 
-const version = "1.4.0"
+const version = "1.4.4"
 
-// Global for tracking stats and colors
+type PodStats struct {
+	TotalBytes int64
+	TCPBytes   int64
+	UDPBytes   int64
+	ICMPBytes  int64
+	RemoteIPs  map[string]*int64
+}
+
 var (
-	stats      = make(map[string]*int64)
+	statsMap   = make(map[string]*PodStats)
 	statsMutex sync.Mutex
-	ansiColors = []string{"\033[32m", "\033[33m", "\033[34m", "\033[35m", "\033[36m", "\033[31m"} 
+	startTime  time.Time
+	ansiColors = []string{"\033[32m", "\033[33m", "\033[34m", "\033[35m", "\033[36m", "\033[31m"}
+	portRegex  = regexp.MustCompile(`(\.(80|443|3306|5432|6379|8080|2379|9090|53)\b)`)
+	ipRegex    = regexp.MustCompile(`(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})`)
 )
 
 func boolPtr(b bool) *bool { return &b }
 
 func main() {
-	// 1. Define Flags
 	nsFlag := flag.String("n", "", "Namespace (defaults to current context)")
-	pcapFlag := flag.Bool("pcap", false, "Output raw PCAP binary (saves to files if multiple pods matched)")
-	debugFlag := flag.Bool("debug", false, "Force Standalone Debug Pod (bypasses security restrictions)")
-	labelFlag := flag.String("l", "", "Label selector (e.g. app=nginx)")
-	helpFlag := flag.Bool("h", false, "Show this help menu")
+	pcapFlag := flag.Bool("pcap", false, "Output raw PCAP binary")
+	debugFlag := flag.Bool("debug", false, "Force Standalone Debug Pod")
+	labelFlag := flag.String("l", "", "Label selector")
+	helpFlag := flag.Bool("h", false, "Show help")
 
-	// Custom Usage/Help Message
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "  _____          _                \n")
 		fmt.Fprintf(os.Stderr, " |  __ \\        | |               \n")
@@ -52,46 +61,21 @@ func main() {
 		fmt.Fprintf(os.Stderr, " | |  | (_) | (_| | |_| | | | | | |\n")
 		fmt.Fprintf(os.Stderr, " |_|   \\___/ \\__,_|_| |_| |_| |_|\n")
 		fmt.Fprintf(os.Stderr, "         v%s - Kubernetes Sniffer\n\n", version)
-
-		fmt.Fprintf(os.Stderr, "Usage:\n")
-		fmt.Fprintf(os.Stderr, "  podump [options] [pod-name-search] [tcpdump-filters]\n\n")
-
-		fmt.Fprintf(os.Stderr, "Options:\n")
+		fmt.Fprintf(os.Stderr, "Usage: podump [options] [pod-name-search] [tcpdump-filters]\n")
 		flag.PrintDefaults()
-
-		fmt.Fprintf(os.Stderr, "\nExamples:\n")
-		fmt.Fprintf(os.Stderr, "  # Sniff multiple pods by label and save separate PCAPs\n")
-		fmt.Fprintf(os.Stderr, "  podump -l app=nginx -pcap\n\n")
-
-		fmt.Fprintf(os.Stderr, "  # Sniff specific port on all pods matching 'api'\n")
-		fmt.Fprintf(os.Stderr, "  podump api port 8080\n\n")
-
-		fmt.Fprintf(os.Stderr, "  # Stream a single pod directly to Wireshark\n")
-		fmt.Fprintf(os.Stderr, "  podump -pcap my-pod | wireshark -k -i -\n\n")
-
 		os.Exit(0)
 	}
 
-	// Bulletproof Argument Parsing
 	cleanArgs := []string{os.Args[0]}
 	for _, arg := range os.Args[1:] {
-		if arg == "-debug" || arg == "--debug" {
-			*debugFlag = true
-		} else if arg == "-h" || arg == "--help" {
-			flag.Usage()
-		} else {
-			cleanArgs = append(cleanArgs, arg)
-		}
+		if arg == "-debug" || arg == "--debug" { *debugFlag = true } else if arg == "-h" || arg == "--help" { flag.Usage() } else { cleanArgs = append(cleanArgs, arg) }
 	}
 	os.Args = cleanArgs
 	flag.Parse()
 
 	args := flag.Args()
-	if *helpFlag || (len(args) < 1 && *labelFlag == "") {
-		flag.Usage()
-	}
+	if *helpFlag || (len(args) < 1 && *labelFlag == "") { flag.Usage() }
 
-	// 2. K8s Config Setup
 	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
 	kubeConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, &clientcmd.ConfigOverrides{})
 	namespace, _, _ := kubeConfig.Namespace()
@@ -102,15 +86,9 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// 3. Discovery Logic
 	var targetPods []corev1.Pod
 	listOpts := metav1.ListOptions{LabelSelector: *labelFlag}
-	allPods, err := clientset.CoreV1().Pods(namespace).List(ctx, listOpts)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "❌ List Error: %v\n", err)
-		os.Exit(1)
-	}
-
+	allPods, _ := clientset.CoreV1().Pods(namespace).List(ctx, listOpts)
 	for _, p := range allPods.Items {
 		if len(args) > 0 {
 			if strings.Contains(p.Name, args[0]) { targetPods = append(targetPods, p) }
@@ -118,31 +96,22 @@ func main() {
 	}
 
 	if len(targetPods) == 0 {
-		fmt.Fprintf(os.Stderr, "❌ No pods found matching criteria.\n")
+		fmt.Fprintf(os.Stderr, "❌ No pods found.\n")
 		os.Exit(1)
 	}
 
-	// 4. Handle Multi-Pod PCAP Storage
-	pcapDir := ""
-	if *pcapFlag && len(targetPods) > 1 {
-		pcapDir = fmt.Sprintf("captures_%s", time.Now().Format("20060102_150405"))
-		os.MkdirAll(pcapDir, 0755)
-		fmt.Fprintf(os.Stderr, "📂 Multiple pods detected. Saving PCAPs to: %s/\n", pcapDir)
+	tcpdumpCmd := []string{"tcpdump", "-i", "any", "--immediate-mode", "-l", "-n"}
+	if *pcapFlag {
+		tcpdumpCmd = []string{"tcpdump", "-i", "any", "--immediate-mode", "-U", "-w", "-"}
 	}
+	if len(args) > 1 { tcpdumpCmd = append(tcpdumpCmd, args[1:]...) }
 
-	// 5. Build Command
-	tcpdumpFilters := []string{}
-	if len(args) > 1 { tcpdumpFilters = args[1:] }
-	tcpdumpCmd := []string{"tcpdump", "-i", "any", "--immediate-mode"}
-	if *pcapFlag { tcpdumpCmd = append(tcpdumpCmd, "-U", "-w", "-") } else { tcpdumpCmd = append(tcpdumpCmd, "-l", "-n") }
-	tcpdumpCmd = append(tcpdumpCmd, tcpdumpFilters...)
-
-	// 6. Multicast Execution
 	var wg sync.WaitGroup
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
-	fmt.Fprintf(os.Stderr, "📡 Starting capture on %d pod(s). Press Ctrl+C to stop.\n", len(targetPods))
+	fmt.Fprintf(os.Stderr, "📡 Sniffing %d pod(s)...\n", len(targetPods))
+	startTime = time.Now()
 
 	for i, pod := range targetPods {
 		color := ansiColors[i%len(ansiColors)]
@@ -161,13 +130,13 @@ func main() {
 				pName = p.Name
 				cName = injectEphemeral(ctx, clientset, namespace, &p, tcpdumpCmd)
 			}
-			streamPackets(ctx, clientset, config, namespace, pName, cName, p.Name, *pcapFlag, pcapDir, c)
+			streamPackets(ctx, clientset, config, namespace, pName, cName, p.Name, c, *pcapFlag)
 		}(pod, color)
 	}
 
 	go func() {
 		<-sigChan
-		fmt.Fprintf(os.Stderr, "\n[Stop] Terminating all captures...\n")
+		fmt.Fprintf(os.Stderr, "\n[Stop] Stopping captures...\n")
 		cancel()
 	}()
 
@@ -176,20 +145,112 @@ func main() {
 }
 
 func printSummary() {
-	fmt.Fprintf(os.Stderr, "\n📊 --- CAPTURE SUMMARY ---\n")
-	fmt.Fprintf(os.Stderr, "%-40s %-15s\n", "POD NAME", "DATA CAPTURED")
-	fmt.Fprintf(os.Stderr, "%-40s %-15s\n", "--------", "-------------")
+	duration := time.Since(startTime).Seconds()
+	if duration < 1 { duration = 1 }
+	fmt.Fprintf(os.Stderr, "\n📊 --- TRAFFIC SUMMARY (%ds) ---\n", int(duration))
 	
 	statsMutex.Lock()
 	defer statsMutex.Unlock()
-	for name, bytes := range stats {
-		size := float64(*bytes)
-		unit := "B"
-		if size > 1024*1024 { size = size / (1024 * 1024); unit = "MB"
-		} else if size > 1024 { size = size / 1024; unit = "KB" }
-		fmt.Fprintf(os.Stderr, "%-40s %.2f %s\n", name, size, unit)
+
+	for podName, s := range statsMap {
+		total := float64(s.TotalBytes) / 1024
+		fmt.Fprintf(os.Stderr, "\n📦 POD: %s (Total: %.2f KB)\n", podName, total)
+		fmt.Fprintf(os.Stderr, "   ├─ TCP:  %.1f KB | UDP: %.1f KB | ICMP: %.1f KB\n", 
+			float64(s.TCPBytes)/1024, float64(s.UDPBytes)/1024, float64(s.ICMPBytes)/1024)
+		
+		if len(s.RemoteIPs) > 0 {
+			fmt.Fprintf(os.Stderr, "   └─ TOP TALKERS (IPs):\n")
+			type ipEntry struct { ip string; val int64 }
+			var ips []ipEntry
+			for ip, val := range s.RemoteIPs { ips = append(ips, ipEntry{ip, *val}) }
+			sort.Slice(ips, func(i, j int) bool { return ips[i].val > ips[j].val })
+
+			for count, e := range ips {
+				if count >= 3 { break }
+				fmt.Fprintf(os.Stderr, "      • %-15s %8.1f KB\n", e.ip, float64(e.val)/1024)
+			}
+		}
 	}
-	fmt.Fprintf(os.Stderr, "--------------------------\n")
+	fmt.Fprintf(os.Stderr, "\n------------------------------------------\n")
+}
+
+func streamPackets(ctx context.Context, clientset *kubernetes.Clientset, config *rest.Config, ns, pod, container, originalName, color string, isPcap bool) {
+	if container == "" { return }
+	
+	statsMutex.Lock()
+	statsMap[originalName] = &PodStats{RemoteIPs: make(map[string]*int64)}
+	statsMutex.Unlock()
+
+	for {
+		select {
+		case <-ctx.Done(): return
+		default:
+			p, _ := clientset.CoreV1().Pods(ns).Get(ctx, pod, metav1.GetOptions{})
+			if p != nil {
+				for _, s := range append(p.Status.ContainerStatuses, p.Status.EphemeralContainerStatuses...) {
+					if s.Name == container && s.State.Running != nil { goto ready }
+				}
+			}
+			time.Sleep(1 * time.Second)
+		}
+	}
+
+ready:
+	req := clientset.CoreV1().RESTClient().Post().Resource("pods").Namespace(ns).Name(pod).SubResource("attach").
+		VersionedParams(&corev1.PodAttachOptions{Container: container, Stdout: true, Stderr: true}, scheme.ParameterCodec)
+
+	exec, _ := remotecommand.NewSPDYExecutor(config, "POST", req.URL())
+	
+	pw := &prefixWriter{
+		w:        os.Stdout,
+		prefix:   fmt.Sprintf("%s[%s]\033[0m ", color, originalName),
+		podName:  originalName,
+		isPcap:   isPcap,
+	}
+
+	_ = exec.StreamWithContext(ctx, remotecommand.StreamOptions{Stdout: pw, Stderr: os.Stderr})
+}
+
+type prefixWriter struct {
+	w       io.Writer
+	prefix  string
+	podName string
+	isPcap  bool
+}
+
+func (pw *prefixWriter) Write(p []byte) (n int, err error) {
+	s := statsMap[pw.podName]
+	
+	// If it's raw binary PCAP, we only count bytes, we can't parse text logic
+	if pw.isPcap {
+		atomic.AddInt64(&s.TotalBytes, int64(len(p)))
+		return pw.w.Write(p)
+	}
+
+	lines := strings.Split(string(p), "\n")
+	for _, line := range lines {
+		if line == "" { continue }
+		lineLen := int64(len(line))
+		atomic.AddInt64(&s.TotalBytes, lineLen)
+
+		if strings.Contains(line, "TCP") { atomic.AddInt64(&s.TCPBytes, lineLen) }
+		if strings.Contains(line, "UDP") { atomic.AddInt64(&s.UDPBytes, lineLen) }
+		if strings.Contains(line, "ICMP") { atomic.AddInt64(&s.ICMPBytes, lineLen) }
+
+		foundIPs := ipRegex.FindAllString(line, -1)
+		for _, ip := range foundIPs {
+			statsMutex.Lock()
+			if _, ok := s.RemoteIPs[ip]; !ok {
+				var v int64 = 0
+				s.RemoteIPs[ip] = &v
+			}
+			atomic.AddInt64(s.RemoteIPs[ip], lineLen/2)
+			statsMutex.Unlock()
+		}
+		highlighted := portRegex.ReplaceAllString(line, "\033[1;31m$1\033[0m")
+		fmt.Fprintf(pw.w, "%s%s\n", pw.prefix, highlighted)
+	}
+	return len(p), nil
 }
 
 func injectEphemeral(ctx context.Context, clientset *kubernetes.Clientset, ns string, target *corev1.Pod, cmd []string) string {
@@ -228,70 +289,4 @@ func createDebugPod(ctx context.Context, clientset *kubernetes.Clientset, ns str
 	}
 	clientset.CoreV1().Pods(ns).Create(ctx, pod, metav1.CreateOptions{})
 	return pName
-}
-
-func streamPackets(ctx context.Context, clientset *kubernetes.Clientset, config *rest.Config, ns, pod, container, originalName string, isPcap bool, pcapDir string, color string) {
-	if container == "" { return }
-	
-	statsMutex.Lock()
-	var bCount int64 = 0
-	stats[originalName] = &bCount
-	statsMutex.Unlock()
-
-	for {
-		select {
-		case <-ctx.Done(): return
-		default:
-			p, err := clientset.CoreV1().Pods(ns).Get(ctx, pod, metav1.GetOptions{})
-			if err == nil {
-				statuses := append(p.Status.ContainerStatuses, p.Status.EphemeralContainerStatuses...)
-				for _, s := range statuses {
-					if s.Name == container && s.State.Running != nil { goto ready }
-				}
-			}
-			time.Sleep(1 * time.Second)
-		}
-	}
-
-ready:
-	fmt.Fprintf(os.Stderr, "%s🚀 [%s] Active!\033[0m\n", color, originalName)
-	req := clientset.CoreV1().RESTClient().Post().Resource("pods").Namespace(ns).Name(pod).SubResource("attach").
-		VersionedParams(&corev1.PodAttachOptions{Container: container, Stdout: true, Stderr: true}, scheme.ParameterCodec)
-
-	exec, _ := remotecommand.NewSPDYExecutor(config, "POST", req.URL())
-
-	var out io.Writer
-	if isPcap && pcapDir != "" {
-		f, _ := os.Create(filepath.Join(pcapDir, fmt.Sprintf("%s.pcap", originalName)))
-		defer f.Close()
-		out = f
-	} else if isPcap { out = os.Stdout
-	} else { out = &prefixWriter{w: os.Stdout, prefix: fmt.Sprintf("%s[%s]\033[0m ", color, originalName)} }
-
-	countedOut := &countWriter{w: out, count: stats[originalName]}
-	_ = exec.StreamWithContext(ctx, remotecommand.StreamOptions{Stdout: countedOut, Stderr: os.Stderr})
-}
-
-type countWriter struct {
-	w     io.Writer
-	count *int64
-}
-
-func (cw *countWriter) Write(p []byte) (n int, err error) {
-	atomic.AddInt64(cw.count, int64(len(p)))
-	return cw.w.Write(p)
-}
-
-type prefixWriter struct {
-	w      io.Writer
-	prefix string
-}
-
-func (pw *prefixWriter) Write(p []byte) (n int, err error) {
-	lines := strings.Split(string(p), "\n")
-	for i, line := range lines {
-		if line == "" && i == len(lines)-1 { continue }
-		fmt.Fprintf(pw.w, "%s%s\n", pw.prefix, line)
-	}
-	return len(p), nil
 }
