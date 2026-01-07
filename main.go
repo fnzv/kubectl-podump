@@ -221,7 +221,6 @@ type prefixWriter struct {
 func (pw *prefixWriter) Write(p []byte) (n int, err error) {
 	s := statsMap[pw.podName]
 	
-	// If it's raw binary PCAP, we only count bytes, we can't parse text logic
 	if pw.isPcap {
 		atomic.AddInt64(&s.TotalBytes, int64(len(p)))
 		return pw.w.Write(p)
@@ -233,10 +232,19 @@ func (pw *prefixWriter) Write(p []byte) (n int, err error) {
 		lineLen := int64(len(line))
 		atomic.AddInt64(&s.TotalBytes, lineLen)
 
-		if strings.Contains(line, "TCP") { atomic.AddInt64(&s.TCPBytes, lineLen) }
-		if strings.Contains(line, "UDP") { atomic.AddInt64(&s.UDPBytes, lineLen) }
-		if strings.Contains(line, "ICMP") { atomic.AddInt64(&s.ICMPBytes, lineLen) }
+		// SMART PROTOCOL DETECTION
+		// 1. TCP: Look for Flags [ ] or literal TCP
+		if strings.Contains(line, "Flags [") || strings.Contains(line, "TCP") {
+			atomic.AddInt64(&s.TCPBytes, lineLen)
+		} else if strings.Contains(line, "UDP") || strings.Contains(line, "proto 17") || strings.Contains(line, "ip-proto-17") {
+			// 2. UDP: Look for literal UDP or IP protocol 17
+			atomic.AddInt64(&s.UDPBytes, lineLen)
+		} else if strings.Contains(line, "ICMP") || strings.Contains(line, "proto 1") {
+			// 3. ICMP: Look for literal ICMP or IP protocol 1
+			atomic.AddInt64(&s.ICMPBytes, lineLen)
+		}
 
+		// IP EXTRACTION
 		foundIPs := ipRegex.FindAllString(line, -1)
 		for _, ip := range foundIPs {
 			statsMutex.Lock()
@@ -244,9 +252,11 @@ func (pw *prefixWriter) Write(p []byte) (n int, err error) {
 				var v int64 = 0
 				s.RemoteIPs[ip] = &v
 			}
-			atomic.AddInt64(s.RemoteIPs[ip], lineLen/2)
+			// Distribute the line length among found IPs
+			atomic.AddInt64(s.RemoteIPs[ip], lineLen/int64(len(foundIPs)))
 			statsMutex.Unlock()
 		}
+
 		highlighted := portRegex.ReplaceAllString(line, "\033[1;31m$1\033[0m")
 		fmt.Fprintf(pw.w, "%s%s\n", pw.prefix, highlighted)
 	}
