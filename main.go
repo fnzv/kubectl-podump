@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -23,7 +24,14 @@ import (
 	"k8s.io/client-go/tools/remotecommand"
 )
 
-const version = "1.3.2"
+const version = "1.4.0"
+
+// Global for tracking stats and colors
+var (
+	stats      = make(map[string]*int64)
+	statsMutex sync.Mutex
+	ansiColors = []string{"\033[32m", "\033[33m", "\033[34m", "\033[35m", "\033[36m", "\033[31m"} 
+)
 
 func boolPtr(b bool) *bool { return &b }
 
@@ -87,17 +95,14 @@ func main() {
 	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
 	kubeConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, &clientcmd.ConfigOverrides{})
 	namespace, _, _ := kubeConfig.Namespace()
-	if *nsFlag != "" {
-		namespace = *nsFlag
-	}
+	if *nsFlag != "" { namespace = *nsFlag }
 	config, _ := kubeConfig.ClientConfig()
 	clientset, _ := kubernetes.NewForConfig(config)
 	
-	// --- FIX: Setup context with cancellation for Ctrl+C ---
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// 3. Discovery Logic (Label + Search Term)
+	// 3. Discovery Logic
 	var targetPods []corev1.Pod
 	listOpts := metav1.ListOptions{LabelSelector: *labelFlag}
 	allPods, err := clientset.CoreV1().Pods(namespace).List(ctx, listOpts)
@@ -108,12 +113,8 @@ func main() {
 
 	for _, p := range allPods.Items {
 		if len(args) > 0 {
-			if strings.Contains(p.Name, args[0]) {
-				targetPods = append(targetPods, p)
-			}
-		} else {
-			targetPods = append(targetPods, p)
-		}
+			if strings.Contains(p.Name, args[0]) { targetPods = append(targetPods, p) }
+		} else { targetPods = append(targetPods, p) }
 	}
 
 	if len(targetPods) == 0 {
@@ -131,15 +132,9 @@ func main() {
 
 	// 5. Build Command
 	tcpdumpFilters := []string{}
-	if len(args) > 1 {
-		tcpdumpFilters = args[1:]
-	}
+	if len(args) > 1 { tcpdumpFilters = args[1:] }
 	tcpdumpCmd := []string{"tcpdump", "-i", "any", "--immediate-mode"}
-	if *pcapFlag {
-		tcpdumpCmd = append(tcpdumpCmd, "-U", "-w", "-")
-	} else {
-		tcpdumpCmd = append(tcpdumpCmd, "-l", "-n")
-	}
+	if *pcapFlag { tcpdumpCmd = append(tcpdumpCmd, "-U", "-w", "-") } else { tcpdumpCmd = append(tcpdumpCmd, "-l", "-n") }
 	tcpdumpCmd = append(tcpdumpCmd, tcpdumpFilters...)
 
 	// 6. Multicast Execution
@@ -149,15 +144,15 @@ func main() {
 
 	fmt.Fprintf(os.Stderr, "📡 Starting capture on %d pod(s). Press Ctrl+C to stop.\n", len(targetPods))
 
-	for _, pod := range targetPods {
+	for i, pod := range targetPods {
+		color := ansiColors[i%len(ansiColors)]
 		wg.Add(1)
-		go func(p corev1.Pod) {
+		go func(p corev1.Pod, c string) {
 			defer wg.Done()
 			var pName, cName string
 			if *debugFlag {
 				cName = "sniffer"
 				pName = createDebugPod(ctx, clientset, namespace, &p, tcpdumpCmd)
-				// FIX: Ensure debug pod is deleted even if this goroutine finishes early
 				defer func() {
 					grace := int64(0)
 					clientset.CoreV1().Pods(namespace).Delete(context.Background(), pName, metav1.DeleteOptions{GracePeriodSeconds: &grace})
@@ -166,18 +161,35 @@ func main() {
 				pName = p.Name
 				cName = injectEphemeral(ctx, clientset, namespace, &p, tcpdumpCmd)
 			}
-			streamPackets(ctx, clientset, config, namespace, pName, cName, p.Name, *pcapFlag, pcapDir)
-		}(pod)
+			streamPackets(ctx, clientset, config, namespace, pName, cName, p.Name, *pcapFlag, pcapDir, c)
+		}(pod, color)
 	}
 
-	// --- FIX: Global Signal Handler ---
 	go func() {
 		<-sigChan
 		fmt.Fprintf(os.Stderr, "\n[Stop] Terminating all captures...\n")
-		cancel() // This kills the Context, stopping all network streams
+		cancel()
 	}()
 
 	wg.Wait()
+	printSummary()
+}
+
+func printSummary() {
+	fmt.Fprintf(os.Stderr, "\n📊 --- CAPTURE SUMMARY ---\n")
+	fmt.Fprintf(os.Stderr, "%-40s %-15s\n", "POD NAME", "DATA CAPTURED")
+	fmt.Fprintf(os.Stderr, "%-40s %-15s\n", "--------", "-------------")
+	
+	statsMutex.Lock()
+	defer statsMutex.Unlock()
+	for name, bytes := range stats {
+		size := float64(*bytes)
+		unit := "B"
+		if size > 1024*1024 { size = size / (1024 * 1024); unit = "MB"
+		} else if size > 1024 { size = size / 1024; unit = "KB" }
+		fmt.Fprintf(os.Stderr, "%-40s %.2f %s\n", name, size, unit)
+	}
+	fmt.Fprintf(os.Stderr, "--------------------------\n")
 }
 
 func injectEphemeral(ctx context.Context, clientset *kubernetes.Clientset, ns string, target *corev1.Pod, cmd []string) string {
@@ -185,27 +197,20 @@ func injectEphemeral(ctx context.Context, clientset *kubernetes.Clientset, ns st
 	io.WriteString(h, strings.Join(cmd, ""))
 	io.WriteString(h, fmt.Sprintf("%d", time.Now().UnixNano()))
 	cName := fmt.Sprintf("pd-%x", h.Sum(nil))[:12]
-
 	ephemeral := corev1.EphemeralContainer{
 		EphemeralContainerCommon: corev1.EphemeralContainerCommon{
-			Name:            cName,
-			Image:           "ghcr.io/fnzv/podump",
-			Command:         cmd,
+			Name: cName, Image: "ghcr.io/fnzv/podump", Command: cmd,
 			ImagePullPolicy: corev1.PullAlways,
 			SecurityContext: &corev1.SecurityContext{
-				Privileged:   boolPtr(true),
+				Privileged: boolPtr(true),
 				Capabilities: &corev1.Capabilities{Add: []corev1.Capability{"NET_ADMIN", "NET_RAW"}},
 			},
 		},
 	}
-
 	latest, _ := clientset.CoreV1().Pods(ns).Get(ctx, target.Name, metav1.GetOptions{})
 	latest.Spec.EphemeralContainers = append(latest.Spec.EphemeralContainers, ephemeral)
 	_, err := clientset.CoreV1().Pods(ns).UpdateEphemeralContainers(ctx, latest.Name, latest, metav1.UpdateOptions{})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "❌ [%s] Injection failed: %v\n", target.Name, err)
-		return ""
-	}
+	if err != nil { return "" }
 	return cName
 }
 
@@ -214,13 +219,9 @@ func createDebugPod(ctx context.Context, clientset *kubernetes.Clientset, ns str
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: pName, Namespace: ns, Labels: map[string]string{"podump-owner": "cli"}},
 		Spec: corev1.PodSpec{
-			NodeName:      target.Spec.NodeName,
-			HostNetwork:   true,
-			RestartPolicy: corev1.RestartPolicyNever,
+			NodeName: target.Spec.NodeName, HostNetwork: true, RestartPolicy: corev1.RestartPolicyNever,
 			Containers: []corev1.Container{{
-				Name:            "sniffer",
-				Image:           "ghcr.io/fnzv/podump",
-				Command:         cmd,
+				Name: "sniffer", Image: "ghcr.io/fnzv/podump", Command: cmd,
 				SecurityContext: &corev1.SecurityContext{Privileged: boolPtr(true)},
 			}},
 		},
@@ -229,24 +230,23 @@ func createDebugPod(ctx context.Context, clientset *kubernetes.Clientset, ns str
 	return pName
 }
 
-func streamPackets(ctx context.Context, clientset *kubernetes.Clientset, config *rest.Config, ns, pod, container, originalName string, isPcap bool, pcapDir string) {
-	if container == "" {
-		return
-	}
+func streamPackets(ctx context.Context, clientset *kubernetes.Clientset, config *rest.Config, ns, pod, container, originalName string, isPcap bool, pcapDir string, color string) {
+	if container == "" { return }
+	
+	statsMutex.Lock()
+	var bCount int64 = 0
+	stats[originalName] = &bCount
+	statsMutex.Unlock()
 
-	// Readiness Wait
 	for {
 		select {
-		case <-ctx.Done(): // FIX: Stop waiting if Ctrl+C is pressed
-			return
+		case <-ctx.Done(): return
 		default:
 			p, err := clientset.CoreV1().Pods(ns).Get(ctx, pod, metav1.GetOptions{})
 			if err == nil {
 				statuses := append(p.Status.ContainerStatuses, p.Status.EphemeralContainerStatuses...)
 				for _, s := range statuses {
-					if s.Name == container && s.State.Running != nil {
-						goto ready
-					}
+					if s.Name == container && s.State.Running != nil { goto ready }
 				}
 			}
 			time.Sleep(1 * time.Second)
@@ -254,34 +254,34 @@ func streamPackets(ctx context.Context, clientset *kubernetes.Clientset, config 
 	}
 
 ready:
-	fmt.Fprintf(os.Stderr, "🚀 [%s] Active!\n", originalName)
+	fmt.Fprintf(os.Stderr, "%s🚀 [%s] Active!\033[0m\n", color, originalName)
 	req := clientset.CoreV1().RESTClient().Post().Resource("pods").Namespace(ns).Name(pod).SubResource("attach").
 		VersionedParams(&corev1.PodAttachOptions{Container: container, Stdout: true, Stderr: true}, scheme.ParameterCodec)
 
 	exec, _ := remotecommand.NewSPDYExecutor(config, "POST", req.URL())
 
 	var out io.Writer
-	if isPcap {
-		if pcapDir != "" {
-			f, err := os.Create(filepath.Join(pcapDir, fmt.Sprintf("%s.pcap", originalName)))
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "❌ Could not create file for %s\n", originalName)
-				return
-			}
-			defer f.Close()
-			out = f
-		} else {
-			out = os.Stdout
-		}
-	} else {
-		out = &prefixWriter{w: os.Stdout, prefix: fmt.Sprintf("[%s] ", originalName)}
-	}
+	if isPcap && pcapDir != "" {
+		f, _ := os.Create(filepath.Join(pcapDir, fmt.Sprintf("%s.pcap", originalName)))
+		defer f.Close()
+		out = f
+	} else if isPcap { out = os.Stdout
+	} else { out = &prefixWriter{w: os.Stdout, prefix: fmt.Sprintf("%s[%s]\033[0m ", color, originalName)} }
 
-	// --- FIX: Use StreamWithContext so cancellation works ---
-	_ = exec.StreamWithContext(ctx, remotecommand.StreamOptions{Stdout: out, Stderr: os.Stderr})
+	countedOut := &countWriter{w: out, count: stats[originalName]}
+	_ = exec.StreamWithContext(ctx, remotecommand.StreamOptions{Stdout: countedOut, Stderr: os.Stderr})
 }
 
-// prefixWriter ensures text output is readable when multiple pods stream at once
+type countWriter struct {
+	w     io.Writer
+	count *int64
+}
+
+func (cw *countWriter) Write(p []byte) (n int, err error) {
+	atomic.AddInt64(cw.count, int64(len(p)))
+	return cw.w.Write(p)
+}
+
 type prefixWriter struct {
 	w      io.Writer
 	prefix string
@@ -290,9 +290,7 @@ type prefixWriter struct {
 func (pw *prefixWriter) Write(p []byte) (n int, err error) {
 	lines := strings.Split(string(p), "\n")
 	for i, line := range lines {
-		if line == "" && i == len(lines)-1 {
-			continue
-		}
+		if line == "" && i == len(lines)-1 { continue }
 		fmt.Fprintf(pw.w, "%s%s\n", pw.prefix, line)
 	}
 	return len(p), nil
