@@ -27,7 +27,7 @@ import (
 	"k8s.io/client-go/tools/remotecommand"
 )
 
-const version = "1.7.1"
+const version = "1.7.2"
 
 type PodStats struct {
 	TotalBytes    int64
@@ -56,6 +56,7 @@ func main() {
 	pcapFlag := flag.Bool("pcap", false, "Output raw PCAP binary")
 	debugFlag := flag.Bool("debug", false, "Force Standalone Debug Pod")
 	httpFlag := flag.Bool("http", false, "Enable HTTP parsing (requires more CPU/Noisy output)")
+	nodnsFlag := flag.Bool("nodns", false, "Disable reverse DNS resolution for public IPs")
 	labelFlag := flag.String("l", "", "Label selector")
 	helpFlag := flag.Bool("h", false, "Show help")
 
@@ -69,15 +70,15 @@ func main() {
 		fmt.Fprintf(os.Stderr, "         v%s - Kubernetes Sniffer\n\n", version)
 		fmt.Fprintf(os.Stderr, "Usage: podump [options] [pod-name-search] [tcpdump-filters]\n\nOptions:\n")
 		flag.PrintDefaults()
-		fmt.Fprintf(os.Stderr, "\nExamples:\n  podump -l app=nginx\n  podump -http api\n")
+		fmt.Fprintf(os.Stderr, "\nExamples:\n  podump -l app=nginx\n  podump -nodns -http api\n")
 		os.Exit(0)
 	}
 
-	// Filter custom flags before parsing
 	cleanArgs := []string{os.Args[0]}
 	for _, arg := range os.Args[1:] {
 		if arg == "-debug" || arg == "--debug" { *debugFlag = true 
 		} else if arg == "-http" || arg == "--http" { *httpFlag = true 
+		} else if arg == "-nodns" || arg == "--nodns" { *nodnsFlag = true
 		} else if arg == "-h" || arg == "--help" { flag.Usage() 
 		} else { cleanArgs = append(cleanArgs, arg) }
 	}
@@ -125,7 +126,7 @@ func main() {
 	} else { 
 		tcpdumpCmd = append(tcpdumpCmd, "-l", "-n")
 		if *httpFlag {
-			tcpdumpCmd = append(tcpdumpCmd, "-A", "-s", "1024") // Add ASCII and larger Snaplen
+			tcpdumpCmd = append(tcpdumpCmd, "-A", "-s", "1024") 
 		}
 	}
 	if len(args) > 1 { tcpdumpCmd = append(tcpdumpCmd, args[1:]...) }
@@ -166,7 +167,7 @@ func main() {
 	}()
 
 	wg.Wait()
-	printSummary()
+	printSummary(*nodnsFlag)
 }
 
 func buildK8sCache(ctx context.Context, clientset *kubernetes.Clientset, ns string) {
@@ -181,7 +182,7 @@ func buildK8sCache(ctx context.Context, clientset *kubernetes.Clientset, ns stri
 	dnsCache["127.0.0.1"] = "localhost"
 }
 
-func printSummary() {
+func printSummary(skipDNS bool) {
 	duration := time.Since(startTime).Seconds()
 	if duration < 1 { duration = 1 }
 	fmt.Fprintf(os.Stderr, "\n📊 --- TRAFFIC SUMMARY (%ds) ---\n", int(duration))
@@ -217,14 +218,18 @@ func printSummary() {
 			for count, e := range ips {
 				if count >= 10 { break }
 				name, exists := dnsCache[e.ip]
-				if !exists {
+				if !exists && !skipDNS {
 					fmt.Fprintf(os.Stderr, "      [resolving %s...]", e.ip)
 					names, err := net.LookupAddr(e.ip)
 					if err == nil && len(names) > 0 { name = names[0]; dnsCache[e.ip] = name
 					} else { name = "unknown" }
 					fmt.Fprintf(os.Stderr, "\r")
 				}
-				resolved := fmt.Sprintf("%-15s (%s)", e.ip, name)
+				
+				resolved := e.ip
+				if name != "" {
+					resolved = fmt.Sprintf("%-15s (%s)", e.ip, name)
+				}
 				fmt.Fprintf(os.Stderr, "      • %-55s %8.1f KB\n", resolved, float64(e.val)/1024)
 			}
 		}
