@@ -26,15 +26,50 @@ const version = "1.2.4"
 func boolPtr(b bool) *bool { return &b }
 
 func main() {
-	nsFlag := flag.String("n", "", "Namespace")
-	pcapFlag := flag.Bool("pcap", false, "Output PCAP binary")
-	debugFlag := flag.Bool("debug", false, "Force Standalone Debug Pod")
+	// 1. Define Flags
+	nsFlag := flag.String("n", "", "Namespace (defaults to current context)")
+	pcapFlag := flag.Bool("pcap", false, "Output raw PCAP binary (best for piping to Wireshark)")
+	debugFlag := flag.Bool("debug", false, "Force Standalone Debug Pod (bypasses security restrictions)")
+	helpFlag := flag.Bool("h", false, "Show this help menu")
 
-	// Scan for -debug anywhere in the command line
+	// Custom Usage/Help Message
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "  _____          _                \n")
+		fmt.Fprintf(os.Stderr, " |  __ \\        | |               \n")
+		fmt.Fprintf(os.Stderr, " | |__) |__   __| |_   _ _ __ ___ \n")
+		fmt.Fprintf(os.Stderr, " |  ___/ _ \\ / _` | | | | '_ ` _ \\ \n")
+		fmt.Fprintf(os.Stderr, " | |  | (_) | (_| | |_| | | | | | |\n")
+		fmt.Fprintf(os.Stderr, " |_|   \\___/ \\__,_|_| |_| |_| |_|\n")
+		fmt.Fprintf(os.Stderr, "         v%s - Kubernetes Sniffer\n\n", version)
+		
+		fmt.Fprintf(os.Stderr, "Usage:\n")
+		fmt.Fprintf(os.Stderr, "  podump [options] <pod-name-search> [tcpdump-filters]\n\n")
+		
+		fmt.Fprintf(os.Stderr, "Options:\n")
+		flag.PrintDefaults()
+		
+		fmt.Fprintf(os.Stderr, "\nExamples:\n")
+		fmt.Fprintf(os.Stderr, "  # Simple sniff of a pod named 'mariadb'\n")
+		fmt.Fprintf(os.Stderr, "  podump mariadb\n\n")
+		
+		fmt.Fprintf(os.Stderr, "  # Sniff specific port in a specific namespace\n")
+		fmt.Fprintf(os.Stderr, "  podump -n production my-api port 8080\n\n")
+		
+		fmt.Fprintf(os.Stderr, "  # Use Debug Mode for hardened clusters (HostNetwork bypass)\n")
+		fmt.Fprintf(os.Stderr, "  podump -debug sensitive-app\n\n")
+		
+		fmt.Fprintf(os.Stderr, "  # Stream directly to Wireshark on your local machine\n")
+		fmt.Fprintf(os.Stderr, "  podump -pcap my-pod | wireshark -k -i -\n\n")
+		
+		os.Exit(0)
+	}
+
 	cleanArgs := []string{os.Args[0]}
 	for _, arg := range os.Args[1:] {
 		if arg == "-debug" || arg == "--debug" {
 			*debugFlag = true
+		} else if arg == "-h" || arg == "--help" {
+			flag.Usage()
 		} else {
 			cleanArgs = append(cleanArgs, arg)
 		}
@@ -43,9 +78,8 @@ func main() {
 	flag.Parse()
 
 	args := flag.Args()
-	if len(args) < 1 {
-		fmt.Fprintf(os.Stderr, "Usage: podump [options] <pod-name-search> [tcpdump-filters]\n")
-		os.Exit(1)
+	if *helpFlag || len(args) < 1 {
+		flag.Usage()
 	}
 
 	searchTerm := args[0]
@@ -160,6 +194,7 @@ func createDebugPod(ctx context.Context, clientset *kubernetes.Clientset, ns str
 		ObjectMeta: metav1.ObjectMeta{
 			Name: pName, 
 			Namespace: ns,
+			Labels: map[string]string{"podump-owner": "cli"},
 		},
 		Spec: corev1.PodSpec{
 			NodeName: target.Spec.NodeName,
@@ -190,29 +225,29 @@ func streamPackets(ctx context.Context, clientset *kubernetes.Clientset, config 
 			continue
 		}
 		
-		// Search for the specific container name in statuses
-		found := false
 		allStatuses := append(p.Status.ContainerStatuses, p.Status.EphemeralContainerStatuses...)
 		for _, s := range allStatuses {
 			if s.Name == container {
 				if s.State.Running != nil {
-					found = true
-					break
+					goto ready
 				}
 				if s.State.Terminated != nil {
-					fmt.Fprintf(os.Stderr, "❌ Container terminated with exit code %d\n", s.State.Terminated.ExitCode)
+					fmt.Fprintf(os.Stderr, "❌ Container failed (Exit %d). Check pod logs.\n", s.State.Terminated.ExitCode)
 					os.Exit(1)
 				}
 			}
 		}
-
-		if found { break }
 		time.Sleep(1 * time.Second)
 	}
 
-	fmt.Fprintf(os.Stderr, "🚀 Capture Active!\n")
+ready:
+	fmt.Fprintf(os.Stderr, "🚀 Capture Active! Press Ctrl+C to stop.\n")
 	req := clientset.CoreV1().RESTClient().Post().Resource("pods").Namespace(ns).Name(pod).SubResource("attach").
-		VersionedParams(&corev1.PodAttachOptions{Container: container, Stdout: true, Stderr: true}, scheme.ParameterCodec)
+		VersionedParams(&corev1.PodAttachOptions{
+			Container: container, 
+			Stdout: true, 
+			Stderr: true,
+		}, scheme.ParameterCodec)
 
 	exec, _ := remotecommand.NewSPDYExecutor(config, "POST", req.URL())
 	_ = exec.Stream(remotecommand.StreamOptions{Stdout: os.Stdout, Stderr: os.Stderr})
