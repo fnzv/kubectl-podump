@@ -49,6 +49,31 @@ Beyond raw packet capture, Podump now provides **real-time traffic statistics, p
 
 ## 🚀 Installation
 
+### Using Krew
+```
+$ kubectl krew install podump
+Updated the local copy of plugin index.
+Installing plugin: podump
+Installed plugin: podump
+\
+ | Use this plugin:
+ | 	kubectl podump
+ | Documentation:
+ | 	https://github.com/fnzv/kubectl-podump
+ | Caveats:
+ | \
+ |  | Usage:
+ |  |   kubectl podump [pod-name]
+ |  | Examples:
+ |  |   kubectl podump -n monitoring prometheus port 9090
+ |  |   kubectl podump my-app --pcap > capture.pcap
+ | /
+/
+WARNING: You installed plugin "podump" from the krew-index plugin repository.
+   These plugins are not audited for security by the Krew maintainers.
+   Run them at your own risk.
+```
+
 ### Using Go
 ```bash
 go install github.com/fnzv/podump@latest
